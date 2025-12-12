@@ -1,0 +1,24 @@
+# --- SEGURIDAD (Lo más importante) ---
+.env
+.env.local
+
+# --- PYTHON ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- ENTORNOS VIRTUALES (Librerías instaladas) ---
+env/
+venv/
+.venv/
+
+# --- IDEs y SISTEMA OPERATIVO ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- CREWAI / LOGS ---
+logs/
+*.log
