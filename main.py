@@ -1,30 +1,45 @@
-import os
 import sys
 import signal
-import subprocess # <--- Necesario para ejecutar Docker desde Python
+import os
+import time
+import subprocess
 
-# --- PARCHE PARA WINDOWS ---
+# --- ⚠️ PARCHE CRÍTICO PARA WINDOWS ⚠️ ---
 if sys.platform.startswith('win'):
+    def _patch_signal(sig_name):
+        if not hasattr(signal, sig_name):
+            setattr(signal, sig_name, signal.SIGTERM if hasattr(signal, 'SIGTERM') else 1)
+
     unix_signals = ['SIGHUP', 'SIGQUIT', 'SIGTRAP', 'SIGIOT', 'SIGBUS', 'SIGFPE', 
                     'SIGUSR1', 'SIGSEGV', 'SIGUSR2', 'SIGPIPE', 'SIGALRM', 'SIGTERM',
                     'SIGCHLD', 'SIGCONT', 'SIGSTOP', 'SIGTSTP', 'SIGTTIN', 'SIGTTOU', 
                     'SIGURG', 'SIGXCPU', 'SIGXFSZ', 'SIGVTALRM', 'SIGPROF', 'SIGWINCH', 
                     'SIGIO', 'SIGPWR', 'SIGSYS']
-    for sig_name in unix_signals:
-        if not hasattr(signal, sig_name):
-            setattr(signal, sig_name, getattr(signal, 'SIGTERM', 1))
+    for sig in unix_signals:
+        _patch_signal(sig)
 
 # --- IMPORTACIONES ---
+from github import Github
 from crewai import Agent, Task, Crew, Process
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
-from crewai_tools import FileWriterTool 
+# 👇 SOLO IMPORTAMOS LO QUE SABEMOS QUE FUNCIONA
+from crewai_tools import FileWriterTool, FileReadTool 
 
 load_dotenv()
 
-# --- CONFIGURACIÓN DEL CEREBRO ---
+# --- CONFIGURACIÓN ---
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+REPO_NAME = os.getenv("GITHUB_REPO_NAME") 
+
+if not GITHUB_TOKEN or not REPO_NAME:
+    print("❌ ERROR: Faltan variables en .env")
+    sys.exit(1)
+
+g = Github(GITHUB_TOKEN)
+
 llm = ChatGoogleGenerativeAI(
-    model="gemini-pro-latest", # Usamos Pro (cuidado con el límite de velocidad)
+    model="gemini-pro-latest", 
     verbose=True,
     temperature=0.1,
     google_api_key=os.getenv("GOOGLE_API_KEY"),
@@ -32,141 +47,205 @@ llm = ChatGoogleGenerativeAI(
     request_timeout=120
 )
 
-# --- HERRAMIENTA UTF-8 ---
+# --- HERRAMIENTAS PERSONALIZADAS (HACK DE HERENCIA) ---
+
+# 1. Herramienta Escritura UTF-8
 class UTF8FileWriterTool(FileWriterTool):
     name: str = "Save File UTF-8"
     description: str = "Saves content to a file using UTF-8 encoding."
-
     def _run(self, filename: str, content: str, **kwargs) -> str:
         try:
             with open(filename, 'w', encoding='utf-8') as f:
                 f.write(content)
-            return f"File {filename} saved successfully in UTF-8."
+            return f"File {filename} saved successfully."
         except Exception as e:
-            return f"Error saving file: {e}"
+            return f"Error saving: {e}"
 
-file_writer_tool = UTF8FileWriterTool()
+# 2. Herramienta Lectura Inteligente (NUEVA)
+# Heredamos de FileReadTool porque sabemos que esa clase sí la tienes bien importada
+# 2. Herramienta Lectura Inteligente (CORREGIDA)
+class SmartFileLister(FileReadTool):
+    name: str = "List Project Files"
+    # 👇 CAMBIO CLAVE: En la descripción obligamos al agente a enviar un parámetro dummy
+    description: str = "Lists relevant files in the current directory. IMPORTANT: You MUST provide a 'file_path' argument (use file_path='.'), otherwise the tool will fail."
 
-# --- AGENTES ---
-product_owner = Agent(
-    role='Technical Product Owner',
-    goal='Define technical requirements.',
-    backstory='Expert PO.',
-    llm=llm,
-    verbose=True,
-    allow_delegation=False
-)
+    # 👇 CAMBIO CLAVE: Aceptamos el argumento file_path para que Pydantic no se queje
+    def _run(self, file_path: str = '.', **kwargs) -> str:
+        # Ignoramos file_path, pero lo recibimos para que no de error
+        ignored_folders = {'.git', 'venv', 'env', '__pycache__', '.idea', '.vscode', 'git'}
+        files = []
+        try:
+            for item in os.listdir('.'):
+                if item not in ignored_folders and not item.startswith('.'):
+                    files.append(item)
+            
+            if not files:
+                return "Directory is empty."
+            return "\n".join(files)
+        except Exception as e:
+            return f"Error listing files: {str(e)}"
 
-developer = Agent(
-    role='Senior Python Developer',
-    goal='Write code and FIX errors based on feedback.', # Actualizado
-    backstory='Expert Python dev. You fix bugs quickly.',
-    llm=llm,
-    verbose=True,
-    allow_delegation=False,
-    tools=[file_writer_tool]
-)
+# Instanciamos las herramientas
+file_writer = UTF8FileWriterTool()
+file_reader = FileReadTool()
+smart_directory_reader = SmartFileLister() # <--- Nuestra nueva herramienta filtrada
 
-qa_engineer = Agent(
-    role='QA Automation Engineer',
-    goal='Write unit tests.',
-    backstory='Expert QA engineer.',
-    llm=llm,
-    verbose=True,
-    allow_delegation=False,
-    tools=[file_writer_tool]
-)
+# --- FUNCIONES AUXILIARES ---
 
-# --- TAREAS INICIALES ---
-task_1_specs = Task(
-    description='Analyze: "Create a simple calculator in Python (add, subtract) and save history to a text file". Define requirements in English.',
-    agent=product_owner,
-    expected_output='Requirements list.'
-)
+def get_ai_tasks():
+    try:
+        repo = g.get_repo(REPO_NAME)
+        issues = repo.get_issues(state='open', labels=['ai-agent'])
+        return issues
+    except Exception as e:
+        print(f"⚠️ Error leyendo issues: {e}")
+        return []
 
-task_2_code = Task(
-    description='Write Python code. Use "Save File UTF-8" tool to create "calculator.py". All messages in ENGLISH. Ensure you implement the save history logic inside the add/subtract functions.',
-    agent=developer,
-    expected_output='File saved confirmation.'
-)
+def create_pull_request(issue_number, issue_title):
+    print(f"🚀 Creando Pull Request para Issue #{issue_number}...")
+    try:
+        current_dir = os.getcwd()
+        branch_name = f"feature/issue-{issue_number}"
+        
+        subprocess.run(f"git checkout -b {branch_name}", shell=True, cwd=current_dir)
+        subprocess.run("git add .", shell=True, cwd=current_dir)
+        subprocess.run(f'git commit -m "AI Fix: {issue_title}"', shell=True, cwd=current_dir)
+        subprocess.run(f"git push origin {branch_name}", shell=True, cwd=current_dir)
+        
+        repo = g.get_repo(REPO_NAME)
+        body = f"Resolves #{issue_number}\n\nGenerated by Autonomous AI Agent 🤖"
+        pr = repo.create_pull(title=f"AI Implementation: {issue_title}", body=body, head=branch_name, base="main")
+        
+        print(f"✅ PR Creada: {pr.html_url}")
+        subprocess.run("git checkout main", shell=True, cwd=current_dir)
+        return True
+    except Exception as e:
+        print(f"❌ Error creando PR: {e}")
+        subprocess.run("git checkout main", shell=True) 
+        return False
 
-task_3_test_plan = Task(
-    description='Write unittest code. Use "Save File UTF-8" tool to create "test_calculator.py". Use "unittest.mock.mock_open" to avoid file permission errors with Docker.',
-    agent=qa_engineer,
-    expected_output='File saved confirmation.'
-)
+def run_docker_tests():
+    print("🧪 Ejecutando Tests en Docker...")
+    cmd = f'docker run --rm -v "{os.getcwd()}":/app -w /app python:3.10-slim python -m unittest test_calculator.py'
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    
+    if result.returncode == 0:
+        return True, result.stderr
+    else:
+        return False, result.stderr
 
-# --- INICIALIZACIÓN DEL EQUIPO ---
-crew = Crew(
-    agents=[product_owner, developer, qa_engineer],
-    tasks=[task_1_specs, task_2_code, task_3_test_plan],
-    verbose=True,
-    process=Process.sequential,
-    max_rpm=2 # Freno de mano activado
-)
+# --- LÓGICA DE RESOLUCIÓN ---
 
-# =================================================================
-# 🔄 EL BUCLE DE AUTOCORRECCIÓN (THE FEEDBACK LOOP)
-# =================================================================
+def solve_issue_with_retries(issue):
+    MAX_RETRIES = 3
+    attempt = 0
+    
+    # Instanciamos la herramienta actualizada
+    smart_reader_instance = SmartFileLister() 
+
+    # AGENTES
+    po = Agent(
+        role='Product Owner', 
+        goal='Analyze requirements.', 
+        backstory='Expert PO.', 
+        llm=llm, 
+        verbose=True, 
+        tools=[smart_reader_instance, file_reader] # Usamos la instancia nueva
+    )
+    
+    dev = Agent(role='Developer', goal='Write robust code.', backstory='Expert Python dev.', llm=llm, verbose=True, tools=[file_reader, file_writer])
+    qa = Agent(role='QA Engineer', goal='Write tests.', backstory='Expert QA.', llm=llm, verbose=True, tools=[file_writer])
+
+    # FASE 1
+    print("🤖 Iniciando ciclo de desarrollo...")
+    
+    # Actualizamos el Prompt para recordarle al agente que ponga el argumento dummy
+    task_analysis = Task(
+        description=f"""
+        1. USE tool 'List Project Files' (remember to provide file_path='.') to see what files exist.
+        2. READ 'calculator.py' (if it exists in the list).
+        3. Analyze GitHub issue: '{issue.body}'.
+        4. Create a plan respecting existing code.
+        """,
+        agent=po,
+        expected_output="Technical Plan."
+    )
+
+    task_code = Task(
+        description="Implement code in 'calculator.py'. Use UTF-8 tool.",
+        agent=dev,
+        expected_output="File saved."
+    )
+
+    task_test = Task(
+        description="Update 'test_calculator.py' using mock_open logic.",
+        agent=qa,
+        expected_output="File saved."
+    )
+
+    crew = Crew(agents=[po, dev, qa], tasks=[task_analysis, task_code, task_test], verbose=True, process=Process.sequential, max_rpm=2)
+    crew.kickoff()
+
+    # FASE 2: AUTO-CORRECCIÓN
+    while attempt < MAX_RETRIES:
+        print(f"\n🔄 Validación {attempt + 1}/{MAX_RETRIES}...")
+        tests_passed, error_log = run_docker_tests()
+        
+        if tests_passed:
+            print("✅ Tests pasados.")
+            return True, None
+        else:
+            print(f"❌ Fallo en Tests. Reparando...")
+            attempt += 1
+            if attempt < MAX_RETRIES:
+                fix_task = Task(
+                    description=f"Tests FAILED:\n{error_log}\n\nFIX the code in calculator.py or test_calculator.py.",
+                    agent=dev,
+                    expected_output="Files fixed."
+                )
+                fix_crew = Crew(agents=[dev], tasks=[fix_task], verbose=True, max_rpm=2)
+                fix_crew.kickoff()
+            
+    return False, error_log
+
+# --- BUCLE PRINCIPAL ---
 
 if __name__ == "__main__":
-    print("🚀 Starting Autonomous AI Team...")
-    
-    # 1. Primera ejecución (Creación desde cero)
-    crew.kickoff()
-    
-    MAX_RETRIES = 3
-    current_try = 0
-    success = False
+    print("==========================================")
+    print(f"👀 VIGILANTE ACTIVO EN: {REPO_NAME}")
+    print("  - Modo: Auto-Healing + Smart Filter")
+    print("==========================================")
 
-    while current_try < MAX_RETRIES and not success:
-        print(f"\n\n🧪 TESTING PHASE (Attempt {current_try + 1}/{MAX_RETRIES})")
-        print("--------------------------------------------------")
-        
-        # 2. Ejecutar Docker desde Python
-        # Usamos os.getcwd() para obtener la ruta correcta en Windows
-        docker_cmd = f'docker run --rm -v "{os.getcwd()}":/app -w /app python:3.10-slim python -m unittest test_calculator.py'
-        
+    while True:
         try:
-            # Ejecutamos el comando y capturamos la salida (stdout) y errores (stderr)
-            result = subprocess.run(docker_cmd, shell=True, capture_output=True, text=True)
+            issues = get_ai_tasks()
             
-            print(result.stderr) # Imprimir lo que dijo Docker
-            
-            if result.returncode == 0:
-                print("\n✅ SUCCESS! All tests passed.")
-                success = True
-            else:
-                print("\n❌ TESTS FAILED. Initiating self-correction protocol...")
-                current_try += 1
-                
-                if current_try < MAX_RETRIES:
-                    # 3. CREAR TAREA DE REPARACIÓN
-                    # Le pasamos el error exacto de Docker al agente
-                    error_log = result.stderr
+            if issues.totalCount > 0:
+                for issue in issues:
+                    print(f"\n🔔 TAREA DETECTADA: {issue.title} (#{issue.number})")
                     
-                    fix_task = Task(
-                        description=f"""
-                        CRITICAL FAILURE IN TESTS.
-                        
-                        Here is the error output from Docker:
-                        {error_log}
-                        
-                        YOUR GOAL: Analyze the error and FIX the code in 'calculator.py' or 'test_calculator.py'.
-                        Overwrite the files with the corrected version using the tool.
-                        """,
-                        agent=developer, # Se lo asignamos al Dev
-                        expected_output="Confirmation that files were fixed and saved."
-                    )
+                    success, final_error = solve_issue_with_retries(issue)
                     
-                    # 4. REINICIAR LA CREW SOLO CON LA TAREA DE FIX
-                    crew.tasks = [fix_task]
-                    print("🤖 Developer is fixing the code...")
-                    crew.kickoff()
-                    
-        except Exception as e:
-            print(f"Error running Docker subprocess: {e}")
-            break
+                    if success:
+                        if create_pull_request(issue.number, issue.title):
+                            issue.create_comment("✅ Trabajo completado. PR Creada.")
+                            print(f"🗑️ Eliminando etiqueta 'ai-agent'...")
+                            issue.remove_from_labels("ai-agent")
+                    else:
+                        print("💀 Se acabaron los intentos.")
+                        issue.create_comment(f"❌ Fallo tras intentos. Error:\n```\n{final_error}\n```")
+                        issue.remove_from_labels("ai-agent")
+                        issue.add_to_labels("help-wanted")
 
-    if not success:
-        print("\n💀 Maximum retries reached. Human intervention required.")
+                    print("💤 Descansando...")
+                    time.sleep(10)
+            else:
+                sys.stdout.write(".")
+                sys.stdout.flush()
+                time.sleep(30)
+                
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(f"\n❌ Error General: {e}")
+            time.sleep(30)
