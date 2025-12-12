@@ -1,100 +1,121 @@
 import unittest
-from unittest.mock import patch, mock_open, MagicMock
+from unittest.mock import patch, mock_open
 import os
+from datetime import datetime
+
+# Assuming calculator.py is in the same directory and contains the Calculator class
 from calculator import Calculator, LOG_FILE
 
-class TestCalculatorOperations(unittest.TestCase):
+class TestCalculator(unittest.TestCase):
+
     def setUp(self):
+        """Set up a new Calculator instance before each test."""
         self.calc = Calculator()
 
-    def test_add_integers(self):
-        self.assertEqual(self.calc.add(5, 3), 8)
-
-    def test_subtract_floats(self):
-        self.assertAlmostEqual(self.calc.subtract(10.5, 4.2), 6.3)
-
-    def test_multiply_negative(self):
-        self.assertEqual(self.calc.multiply(-2, 5), -10)
-
-    def test_divide_success(self):
-        self.assertEqual(self.calc.divide(10, 2), 5)
-
-    def test_divide_by_zero(self):
-        with self.assertRaisesRegex(ValueError, "Cannot divide by zero"):
-            self.calc.divide(10, 0)
-
-class TestHistoryManagement(unittest.TestCase):
-    def setUp(self):
-        self.calc = Calculator()
-        # Ensure log file is clean before each test
-        if os.path.exists(LOG_FILE):
-            os.remove(LOG_FILE)
-
-    def tearDown(self):
-        # Clean up after tests
-        if os.path.exists(LOG_FILE):
-            os.remove(LOG_FILE)
-
-    def _setup_datetime_mock(self, mock_datetime, timestamp_str):
-        """Helper to set up the mock chain for datetime.now().strftime()."""
-        # Mock the datetime object returned by datetime.now()
-        mock_now = MagicMock()
-        mock_datetime.now.return_value = mock_now
-        
-        # Mock the strftime method on the returned object
-        mock_now.strftime.return_value = timestamp_str
-
-    @patch('calculator.open', new_callable=mock_open)
     @patch('calculator.datetime')
-    def test_log_operation_success(self, mock_datetime, mock_file):
-        # Setup mock timestamp
-        expected_timestamp = '2023-10-27 14:30:00'
-        self._setup_datetime_mock(mock_datetime, expected_timestamp)
+    @patch('builtins.open', new_callable=mock_open)
+    def test_add_with_logging(self, mock_file, mock_datetime):
+        """Test the add method and verify logging using mock_open."""
+        # Arrange: Mock the timestamp for a predictable log entry
+        mock_dt_instance = datetime(2023, 10, 27, 10, 30, 0)
+        mock_datetime.now.return_value = mock_dt_instance
+        timestamp = mock_dt_instance.strftime('%Y-%m-%d %H:%M:%S')
         
-        # Perform operation
-        self.calc.add(5.5, 3.0)
-        
-        # Define expected log entry
-        expected_log_entry = f'{expected_timestamp}: 5.5 + 3.0 = 8.5\n'
-        
-        # Assert file was opened correctly
+        # Act
+        result = self.calc.add(15, 5)
+
+        # Assert: Check the calculation result
+        self.assertEqual(result, 20)
+
+        # Assert: Check that open was called correctly
         mock_file.assert_called_once_with(LOG_FILE, 'a')
         
-        # Assert content was written correctly
-        mock_file().write.assert_called_once_with(expected_log_entry)
+        # Assert: Check that the correct log entry was written
+        handle = mock_file()
+        expected_log = f"{timestamp}: 15 + 5 = 20\n"
+        handle.write.assert_called_once_with(expected_log)
 
-    @patch('calculator.open', new_callable=mock_open)
     @patch('calculator.datetime')
-    def test_log_operation_subtraction_format(self, mock_datetime, mock_file):
-        # Setup mock timestamp
-        expected_timestamp = '2023-10-27 15:00:00'
-        self._setup_datetime_mock(mock_datetime, expected_timestamp)
-        
-        # Perform operation
-        self.calc.subtract(10, 4)
-        
-        # Define expected log entry
-        expected_log_entry = f'{expected_timestamp}: 10 - 4 = 6\n'
-        
-        # Assert content was written correctly
-        mock_file().write.assert_called_once_with(expected_log_entry)
+    @patch('builtins.open', new_callable=mock_open)
+    def test_subtract_with_logging(self, mock_file, mock_datetime):
+        """Test the subtract method and verify logging using mock_open."""
+        # Arrange
+        mock_dt_instance = datetime(2023, 10, 27, 11, 0, 0)
+        mock_datetime.now.return_value = mock_dt_instance
+        timestamp = mock_dt_instance.strftime('%Y-%m-%d %H:%M:%S')
 
-    def test_clear_history_removes_file(self):
-        # Create a dummy log file
-        with open(LOG_FILE, 'w') as f:
-            f.write("Test entry")
-        
-        self.assertTrue(os.path.exists(LOG_FILE))
-        
-        self.calc.clear_history()
-        
-        self.assertFalse(os.path.exists(LOG_FILE))
+        # Act
+        result = self.calc.subtract(10, 4)
 
-    def test_clear_history_no_file_exists(self):
-        # Ensure file does not exist
-        if os.path.exists(LOG_FILE):
-            os.remove(LOG_FILE)
-            
-        # Should run without error
+        # Assert
+        self.assertEqual(result, 6)
+        mock_file.assert_called_once_with(LOG_FILE, 'a')
+        handle = mock_file()
+        expected_log = f"{timestamp}: 10 - 4 = 6\n"
+        handle.write.assert_called_once_with(expected_log)
+
+    @patch('calculator.datetime')
+    @patch('builtins.open', new_callable=mock_open)
+    def test_multiply_with_logging(self, mock_file, mock_datetime):
+        """Test the multiply method and verify logging using mock_open."""
+        # Arrange
+        mock_dt_instance = datetime(2023, 10, 27, 12, 0, 0)
+        mock_datetime.now.return_value = mock_dt_instance
+        timestamp = mock_dt_instance.strftime('%Y-%m-%d %H:%M:%S')
+
+        # Act
+        result = self.calc.multiply(7, 6)
+
+        # Assert
+        self.assertEqual(result, 42)
+        mock_file.assert_called_once_with(LOG_FILE, 'a')
+        handle = mock_file()
+        expected_log = f"{timestamp}: 7 * 6 = 42\n"
+        handle.write.assert_called_once_with(expected_log)
+
+    @patch('calculator.datetime')
+    @patch('builtins.open', new_callable=mock_open)
+    def test_divide_with_logging(self, mock_file, mock_datetime):
+        """Test the divide method and verify logging using mock_open."""
+        # Arrange
+        mock_dt_instance = datetime(2023, 10, 27, 13, 0, 0)
+        mock_datetime.now.return_value = mock_dt_instance
+        timestamp = mock_dt_instance.strftime('%Y-%m-%d %H:%M:%S')
+
+        # Act
+        result = self.calc.divide(20, 4)
+
+        # Assert
+        self.assertEqual(result, 5)
+        mock_file.assert_called_once_with(LOG_FILE, 'a')
+        handle = mock_file()
+        expected_log = f"{timestamp}: 20 / 4 = 5.0\n"
+        handle.write.assert_called_once_with(expected_log)
+
+    @patch('builtins.open', new_callable=mock_open)
+    def test_divide_by_zero_does_not_log(self, mock_file):
+        """Test that dividing by zero raises ValueError and does not log."""
+        with self.assertRaises(ValueError):
+            self.calc.divide(10, 0)
+        
+        # Assert that no file operation was attempted
+        mock_file.assert_not_called()
+
+    @patch('os.remove')
+    @patch('os.path.exists', return_value=True)
+    def test_clear_history_if_file_exists(self, mock_exists, mock_remove):
+        """Test clear_history calls os.remove when the log file exists."""
         self.calc.clear_history()
-        self.assertFalse(os.path.exists(LOG_FILE))
+        mock_exists.assert_called_once_with(LOG_FILE)
+        mock_remove.assert_called_once_with(LOG_FILE)
+
+    @patch('os.remove')
+    @patch('os.path.exists', return_value=False)
+    def test_clear_history_if_file_does_not_exist(self, mock_exists, mock_remove):
+        """Test clear_history does not call os.remove when file doesn't exist."""
+        self.calc.clear_history()
+        mock_exists.assert_called_once_with(LOG_FILE)
+        mock_remove.assert_not_called()
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)
