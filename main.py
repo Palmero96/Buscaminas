@@ -4,52 +4,41 @@ import os
 import time
 import subprocess
 
-# --- ⚠️ PARCHE CRÍTICO PARA WINDOWS (ESTO DEBE IR PRIMERO) ⚠️ ---
-# Definimos las señales Unix que faltan en Windows ANTES de importar CrewAI
+# --- ⚠️ PARCHE CRÍTICO PARA WINDOWS ⚠️ ---
 if sys.platform.startswith('win'):
     def _patch_signal(sig_name):
         if not hasattr(signal, sig_name):
-            # Asignamos un valor dummy para engañar a la librería
             setattr(signal, sig_name, signal.SIGTERM if hasattr(signal, 'SIGTERM') else 1)
 
-    # Lista de señales que CrewAI/LangChain podrían buscar
     unix_signals = ['SIGHUP', 'SIGQUIT', 'SIGTRAP', 'SIGIOT', 'SIGBUS', 'SIGFPE', 
                     'SIGUSR1', 'SIGSEGV', 'SIGUSR2', 'SIGPIPE', 'SIGALRM', 'SIGTERM',
                     'SIGCHLD', 'SIGCONT', 'SIGSTOP', 'SIGTSTP', 'SIGTTIN', 'SIGTTOU', 
                     'SIGURG', 'SIGXCPU', 'SIGXFSZ', 'SIGVTALRM', 'SIGPROF', 'SIGWINCH', 
                     'SIGIO', 'SIGPWR', 'SIGSYS']
-    
     for sig in unix_signals:
         _patch_signal(sig)
 
-# --- AHORA SÍ IMPORTAMOS LAS LIBRERÍAS PESADAS ---
+# --- IMPORTACIONES ---
 from github import Github
 from crewai import Agent, Task, Crew, Process
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
-from crewai_tools import FileWriterTool, FileReadTool
+from crewai_tools import FileWriterTool, FileReadTool 
 
 load_dotenv()
 
-# --- CONFIGURACIÓN GITHUB ---
-# Asegúrate de tener estas variables en tu .env
+# --- CONFIGURACIÓN ---
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO_NAME = os.getenv("GITHUB_REPO_NAME") 
 
-# Validación simple para no fallar más tarde
 if not GITHUB_TOKEN or not REPO_NAME:
-    print("❌ ERROR: Faltan GITHUB_TOKEN o GITHUB_REPO_NAME en el archivo .env")
+    print("❌ ERROR: Faltan variables en .env")
     sys.exit(1)
 
-try:
-    g = Github(GITHUB_TOKEN)
-except Exception as e:
-    print(f"❌ Error conectando a GitHub: {e}")
-    sys.exit(1)
+g = Github(GITHUB_TOKEN)
 
-# --- CONFIGURACIÓN DEL CEREBRO ---
 llm = ChatGoogleGenerativeAI(
-    model="gemini-pro-latest", 
+    model="gemini-flash-latest", 
     verbose=True,
     temperature=0.1,
     google_api_key=os.getenv("GOOGLE_API_KEY"),
@@ -57,9 +46,9 @@ llm = ChatGoogleGenerativeAI(
     request_timeout=120
 )
 
-# --- HERRAMIENTAS ---
+# --- HERRAMIENTAS PERSONALIZADAS ---
 
-# 1. Herramienta Escritura UTF-8 (Hack para Docker/Windows)
+# 1. Herramienta Escritura UTF-8
 class UTF8FileWriterTool(FileWriterTool):
     name: str = "Save File UTF-8"
     description: str = "Saves content to a file using UTF-8 encoding. Input: filename, content."
@@ -71,15 +60,39 @@ class UTF8FileWriterTool(FileWriterTool):
         except Exception as e:
             return f"Error saving: {e}"
 
+# 2. Herramienta Lectura Inteligente (Mapa del Proyecto)
+class SmartFileLister(FileReadTool):
+    name: str = "List Project Files"
+    description: str = "Lists relevant files. IMPORTANT: Provide dummy argument file_path='.'."
+
+    def _run(self, file_path: str = '.', **kwargs) -> str:
+        # 1. Carpetas prohibidas
+        ignored_folders = {'.git', 'venv', 'env', '__pycache__', '.idea', '.vscode', 'git'}
+        
+        # 2. Archivos PROTEGIDOS (El agente no sabrá que existen)
+        protected_files = {'main.py', '.env', 'docker-compose.yml', 'Dockerfile'}
+
+        files = []
+        try:
+            for item in os.listdir('.'):
+                # Filtramos carpetas prohibidas, archivos ocultos y archivos protegidos
+                if (item not in ignored_folders) and (item not in protected_files) and (not item.startswith('.')):
+                    files.append(item)
+            
+            if not files:
+                return "Directory is empty (New Project)."
+            return "\n".join(files)
+        except Exception as e:
+            return f"Error listing files: {str(e)}"
+
+# Instancias
 file_writer = UTF8FileWriterTool()
-
-# 2. Herramienta Lectura (Para tener contexto)
 file_reader = FileReadTool()
+smart_directory_reader = SmartFileLister()
 
-# --- FUNCIONES DE GESTIÓN GITHUB ---
+# --- FUNCIONES AUXILIARES ---
 
 def get_ai_tasks():
-    """Busca Issues abiertas con la etiqueta 'ai-agent'"""
     try:
         repo = g.get_repo(REPO_NAME)
         issues = repo.get_issues(state='open', labels=['ai-agent'])
@@ -89,139 +102,184 @@ def get_ai_tasks():
         return []
 
 def create_pull_request(issue_number, issue_title):
-    """Crea una PR con los cambios"""
     print(f"🚀 Creando Pull Request para Issue #{issue_number}...")
     try:
         current_dir = os.getcwd()
-        branch_name = f"feature/issue-{issue_number}"
+        # Limpiamos el título para que sea un nombre de rama válido
+        safe_title = "".join([c if c.isalnum() else "-" for c in issue_title]).lower()[:30]
+        branch_name = f"feature/issue-{issue_number}-{safe_title}"
         
-        # Git commands wrapper
         subprocess.run(f"git checkout -b {branch_name}", shell=True, cwd=current_dir)
         subprocess.run("git add .", shell=True, cwd=current_dir)
         subprocess.run(f'git commit -m "AI Fix: {issue_title}"', shell=True, cwd=current_dir)
         subprocess.run(f"git push origin {branch_name}", shell=True, cwd=current_dir)
         
-        # GitHub API call
         repo = g.get_repo(REPO_NAME)
         body = f"Resolves #{issue_number}\n\nGenerated by Autonomous AI Agent 🤖"
         pr = repo.create_pull(title=f"AI Implementation: {issue_title}", body=body, head=branch_name, base="main")
         
         print(f"✅ PR Creada: {pr.html_url}")
-        
-        # Volver a main
         subprocess.run("git checkout main", shell=True, cwd=current_dir)
         return True
     except Exception as e:
         print(f"❌ Error creando PR: {e}")
-        # Intentar volver a main por si acaso
         subprocess.run("git checkout main", shell=True) 
         return False
 
-# --- EL CICLO DE DESARROLLO (AGENTS) ---
-
-def run_development_cycle(issue_body):
+def run_docker_tests():
+    print("🧪 Ejecutando Tests en Docker (Auto-Discovery)...")
+    # CAMBIO IMPORTANTE: Usamos 'unittest discover' para que encuentre CUALQUIER test
+    # Busca archivos que empiecen por 'test_*.py' en la carpeta actual
+    cmd = f'docker run --rm -v "{os.getcwd()}":/app -w /app python:3.10-slim python -m unittest discover -s . -p "test_*.py"'
     
-    # Definimos agentes aquí para que estén "frescos" en cada tarea
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    
+    if result.returncode == 0:
+        return True, result.stderr
+    else:
+        return False, result.stderr
+
+# --- LÓGICA DE RESOLUCIÓN GENÉRICA ---
+
+def solve_issue_with_retries(issue):
+    MAX_RETRIES = 3
+    attempt = 0
+    
+    # 1. Definición de Agentes
     po = Agent(
-        role='Product Owner',
-        goal='Analyze code and requirements.',
-        backstory='Expert PO. Reads files to understand context.',
-        llm=llm,
-        verbose=True,
-        tools=[file_reader]
+        role='Product Owner', 
+        goal='Analyze the request and map it to project files.', 
+        backstory='Expert PO. You identify which files need to be created or modified.', 
+        llm=llm, verbose=True, tools=[smart_directory_reader, file_reader]
     )
-
+    
     dev = Agent(
-        role='Developer',
-        goal='Modify code without breaking existing features.',
-        backstory='Expert Python dev.',
-        llm=llm,
-        verbose=True,
-        tools=[file_reader, file_writer]
+        role='Developer', 
+        goal='Write clean, working Python code.', 
+        backstory='Expert Python dev. You write modular code and save it using UTF-8.', 
+        llm=llm, verbose=True, tools=[file_reader, file_writer]
     )
-
+    
     qa = Agent(
-        role='QA Engineer',
-        goal='Create robust tests.',
-        backstory='Expert QA.',
-        llm=llm,
-        verbose=True,
-        tools=[file_writer]
+        role='QA Engineer', 
+        goal='Ensure code quality with tests.', 
+        backstory='Expert QA. You write unit tests using unittest and mock.', 
+        llm=llm, verbose=True, tools=[file_writer]
     )
 
-    # Tareas
+    # 2. Tareas DINÁMICAS (Ya no mencionan "calculator.py")
+    print("🤖 Iniciando ciclo de desarrollo genérico...")
+    
     task_analysis = Task(
-        description=f"1. Read 'calculator.py' (if exists). 2. Analyze GitHub requirement: '{issue_body}'. 3. Create a plan.",
+        description=f"""
+        CONTEXT: The user wants to solve this issue: "{issue.title}: {issue.body}".
+        
+        1. USE 'List Project Files' to see the current structure.
+        2. READ relevant files (if any exist) to understand the codebase.
+        3. DECIDE which files need to be created or modified. 
+           (e.g., if it's a minesweeper game, maybe create 'minesweeper.py').
+        4. Output a plan listing the filenames to work on.
+        """,
         agent=po,
-        expected_output="Plan."
+        expected_output="Technical Plan with filenames."
     )
 
     task_code = Task(
-        description="Implement feature in 'calculator.py' using UTF-8 tool. Keep existing logic.",
+        description=f"""
+        Execute the plan. 
+        Implement the requirements for: "{issue.title}".
+        Create or Modify the necessary Python files using 'Save File UTF-8'.
+        IMPORTANT: Ensure the code is complete and functional.
+        """,
         agent=dev,
-        expected_output="File saved."
+        expected_output="Source code files saved."
     )
 
     task_test = Task(
-        description="Update 'test_calculator.py' using mock_open logic.",
+        description="""
+        Create UNIT TESTS for the new code.
+        1. Create a file named 'test_<feature_name>.py' (e.g., test_minesweeper.py).
+        2. Use 'unittest' and 'unittest.mock' (mock_open if needed).
+        3. Ensure the tests cover the main logic implemented by the Developer.
+        """,
         agent=qa,
-        expected_output="File saved."
+        expected_output="Test files saved."
     )
 
-    crew = Crew(
-        agents=[po, dev, qa],
-        tasks=[task_analysis, task_code, task_test],
-        verbose=True,
-        process=Process.sequential,
-        max_rpm=2
-    )
+    crew = Crew(agents=[po, dev, qa], tasks=[task_analysis, task_code, task_test], verbose=True, process=Process.sequential, max_rpm=10)
+    crew.kickoff()
 
-    return crew.kickoff()
+    # 3. Auto-Corrección
+    while attempt < MAX_RETRIES:
+        print(f"\n🔄 Validación {attempt + 1}/{MAX_RETRIES}...")
+        tests_passed, error_log = run_docker_tests()
+        
+        if tests_passed:
+            print("✅ Todos los tests del proyecto pasaron.")
+            return True, None
+        else:
+            print(f"❌ Fallo en Tests. Reparando...")
+            attempt += 1
+            if attempt < MAX_RETRIES:
+                fix_task = Task(
+                    description=f"""
+                    The generic test suite FAILED.
+                    
+                    ERROR LOG:
+                    {error_log}
+                    
+                    INSTRUCTIONS:
+                    1. Read the error log carefully.
+                    2. Identify which file caused the error.
+                    3. FIX the source code or the test code.
+                    4. Overwrite the files with the fix.
+                    """,
+                    agent=dev,
+                    expected_output="Fixed files saved."
+                )
+                fix_crew = Crew(agents=[dev], tasks=[fix_task], verbose=True, max_rpm=10)
+                fix_crew.kickoff()
+            
+    return False, error_log
 
 # --- BUCLE PRINCIPAL ---
 
 if __name__ == "__main__":
     print("==========================================")
     print(f"👀 VIGILANTE ACTIVO EN: {REPO_NAME}")
-    print("Esperando issues con etiqueta 'ai-agent'...")
+    print("  - Modo: 100% Genérico (Cualquier Proyecto)")
     print("==========================================")
 
     while True:
         try:
             issues = get_ai_tasks()
             
-            # Verificamos si hay issues (issues es un iterador paginado, count es lo seguro)
             if issues.totalCount > 0:
                 for issue in issues:
-                    print(f"\n🔔 NUEVA TAREA: {issue.title}")
-                    print(f"📝 Requisitos: {issue.body}")
+                    print(f"\n🔔 TAREA DETECTADA: {issue.title} (#{issue.number})")
                     
-                    print("🤖 Trabajando...")
-                    run_development_cycle(issue.body)
+                    success, final_error = solve_issue_with_retries(issue)
                     
-                    print("🧪 Ejecutando Tests Docker...")
-                    # Ejecución robusta de Docker
-                    cmd = f'docker run --rm -v "{os.getcwd()}":/app -w /app python:3.10-slim python -m unittest test_calculator.py'
-                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                    
-                    if result.returncode == 0:
-                        print("✅ Tests OK.")
+                    if success:
                         if create_pull_request(issue.number, issue.title):
-                            issue.create_comment(f"Trabajo completado. PR Creada. ✅")
+                            issue.create_comment("✅ Tarea completada. Código y tests generados.")
+                            print(f"🗑️ Eliminando etiqueta 'ai-agent'...")
+                            issue.remove_from_labels("ai-agent")
                     else:
-                        print("❌ Fallo en tests.")
-                        issue.create_comment(f"Hubo errores en los tests:\n```\n{result.stderr}\n```")
+                        print("💀 Se acabaron los intentos.")
+                        issue.create_comment(f"❌ No pude resolver la tarea. Error:\n```\n{final_error}\n```")
+                        issue.remove_from_labels("ai-agent")
+                        issue.add_to_labels("help-wanted")
 
-                    print("💤 Pausa de seguridad...")
+                    print("💤 Descansando...")
                     time.sleep(10)
             else:
                 sys.stdout.write(".")
                 sys.stdout.flush()
-                time.sleep(30) # Revisar cada 30 segundos
+                time.sleep(30)
                 
         except KeyboardInterrupt:
-            print("\n🛑 Deteniendo el equipo IA.")
             break
         except Exception as e:
-            print(f"\n❌ Error en el bucle: {e}")
+            print(f"\n❌ Error General: {e}")
             time.sleep(30)
