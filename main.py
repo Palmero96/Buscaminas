@@ -4,11 +4,6 @@ import os
 import time
 import subprocess
 import json
-import logging
-
-logging.basicConfig(level=logging.DEBUG)
-# Fuerza a Python a no usar buffer en la salida (todo sale al instante)
-os.environ["PYTHONUNBUFFERED"] = "1"
 
 # --- ⚠️ PARCHE CRÍTICO PARA WINDOWS ⚠️ ---
 if sys.platform.startswith('win'):
@@ -56,7 +51,7 @@ safety_settings = {
 }
 
 llm_pro = ChatGoogleGenerativeAI(
-    model="gemini-pro-latest",
+    model="gemini-1.5-pro-latest",
     verbose=True,
     temperature=0.2,
     google_api_key=os.getenv("GOOGLE_API_KEY"),
@@ -65,7 +60,7 @@ llm_pro = ChatGoogleGenerativeAI(
 )
 
 llm_flash = ChatGoogleGenerativeAI(
-    model="gemini-flash-latest",
+    model="gemini-1.5-flash-latest",
     verbose=True,
     temperature=0.1,
     google_api_key=os.getenv("GOOGLE_API_KEY"),
@@ -84,31 +79,49 @@ def load_agents_config():
 
 agents_config = load_agents_config()
 
+# --- 🛡️ FUNCIÓN DE AUTO-PROTECCIÓN ---
+def ensure_git_protection():
+    """Se asegura de que .env nunca se suba a GitHub y protege el archivo."""
+    gitignore_path = '.gitignore'
+    env_entry = '.env'
+    
+    if not os.path.exists(gitignore_path):
+        print("🛡️ Creando .gitignore para proteger tus claves...")
+        with open(gitignore_path, 'w') as f:
+            f.write(f"{env_entry}\n__pycache__/\nvenv/\n")
+        return
+
+    with open(gitignore_path, 'r') as f:
+        content = f.read()
+    
+    if env_entry not in content:
+        print("🛡️ Actualizando .gitignore para ocultar .env...")
+        with open(gitignore_path, 'a') as f:
+            f.write(f"\n{env_entry}\n")
+
+ensure_git_protection()
+
+
 # --- HERRAMIENTAS PERSONALIZADAS ---
 
 class UTF8FileWriterTool(FileWriterTool):
     name: str = "Save File UTF-8"
     description: str = "Saves content to a file. You can specify the directory separately. Input: filename, content, directory (optional)."
     
-    # 👇 CAMBIO CRÍTICO: 'directory' ahora es un argumento explícito con valor por defecto None
     def _run(self, filename: str, content: str, directory: str = None, **kwargs) -> str:
-        forbidden_files = ['main.py', '.env', 'agents.json', 'Procfile', 'Dockerfile']
+        forbidden_files = ['main.py', '.env', 'agents.json', 'Procfile', 'Dockerfile', '.gitignore']
         
-        # 1. Construcción de la ruta
         if directory:
-            # Si el agente envía "app" y "routes.py", creamos "app/routes.py"
             file_path = os.path.join(directory, filename)
         else:
             file_path = filename
 
         clean_name = os.path.basename(file_path)
 
-        # 2. Seguridad
         if clean_name in forbidden_files:
             return f"❌ SECURITY ERROR: Modification of '{clean_name}' is forbidden."
 
         try:
-            # 3. Creación de carpetas (Auto-Healing)
             target_folder = os.path.dirname(file_path)
             if target_folder and not os.path.exists(target_folder):
                 try:
@@ -117,7 +130,6 @@ class UTF8FileWriterTool(FileWriterTool):
                 except OSError as e:
                     return f"Error creating directory {target_folder}: {e}"
             
-            # 4. Escritura
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(content)
             return f"File {file_path} saved successfully."
@@ -127,20 +139,17 @@ class UTF8FileWriterTool(FileWriterTool):
 
 class FileDeleteTool(BaseTool):
     name: str = "Delete File"
-    # 👇 CAMBIO CLAVE: Le decimos explícitamente que acepta múltiples archivos
-    description: str = "PERMANENTLY deletes one or multiple files. Input: 'file1.py' or 'file1.py, file2.py, file3.py'."
+    description: str = "PERMANENTLY deletes one or multiple files. Input: 'file1.py' or 'file1.py, file2.py'."
     
     def _run(self, file_path: str) -> str:
-        forbidden_files = ['main.py', '.env', 'agents.json', '.git', 'requirements.txt']
+        forbidden_files = ['main.py', '.env', 'agents.json', '.git', 'requirements.txt', '.gitignore']
         
-        # 1. Separamos por comas si vienen varios archivos
         files_to_delete = [f.strip() for f in file_path.split(',')]
         results = []
 
         for current_file in files_to_delete:
             clean_name = os.path.basename(current_file)
             
-            # Bloqueo de seguridad
             if clean_name in forbidden_files or '.git' in current_file:
                 results.append(f"❌ SECURITY ERROR: Deletion of '{clean_name}' is strictly forbidden.")
                 continue
@@ -163,7 +172,7 @@ class SmartFileLister(FileReadTool):
 
     def _run(self, file_path: str = '.', **kwargs) -> str:
         ignored_folders = {'.git', 'venv', 'env', '__pycache__', '.idea', '.vscode', 'git'}
-        hidden_files = {'main.py', '.env', 'agents.json'}
+        hidden_files = {'main.py', '.env', 'agents.json', '.gitignore'}
 
         files = []
         try:
@@ -221,7 +230,6 @@ def create_pull_request(issue_number, issue_title):
 def run_docker_tests():
     print("🧪 Ejecutando Tests en Docker...")
     
-    # Añadimos PYTHONPATH=. para que los tests encuentren la carpeta 'app'
     docker_command = (
         'if [ -f requirements.txt ]; then pip install -r requirements.txt; fi && '
         'export PYTHONPATH=$PYTHONPATH:. && '
@@ -230,17 +238,16 @@ def run_docker_tests():
 
     cmd = f'docker run --rm -v "{os.getcwd()}":/app -w /app python:3.10-slim bash -c "{docker_command}"'
     
-    # ⚠️ CAMBIO IMPORTANTE: Eliminamos text=True para manejar bytes manualmente
     result = subprocess.run(cmd, shell=True, capture_output=True)
     
-    # Decodificamos con seguridad (ignorando errores de caracteres raros)
+    # Decodificación segura para Windows
     stdout = result.stdout.decode('utf-8', errors='replace')
     stderr = result.stderr.decode('utf-8', errors='replace')
     
     full_output = stdout + "\n" + stderr
 
     if result.returncode == 0:
-        return True, stderr # A veces unittest escribe en stderr aunque pase
+        return True, stderr 
     else:
         return False, full_output
 
@@ -250,52 +257,39 @@ def solve_issue_with_retries(issue):
     MAX_RETRIES = 3
     attempt = 0
     
-    # 1. Definición de Agentes (Igual que antes)
+    # 1. Definición de Agentes
     arch_conf = agents_config['architect']
     manager_conf = agents_config['manager']
     dev_conf = agents_config['developer']
     qa_conf = agents_config['qa']
 
-    # 1. Definición de Agentes con LIMITES INDIVIDUALES
-    
-    # --- EQUIPO PRO (Lentos y Pensadores) ---
-    # Gemini Pro suele tener límites estrictos (ej: 2-60 RPM según tu plan)
     architect = Agent(
         role=arch_conf['role'], goal=arch_conf['goal'], backstory=arch_conf['backstory'],
-        llm=llm_pro, 
-        verbose=True, 
-        allow_delegation=False, 
+        llm=llm_pro, verbose=True, allow_delegation=False, 
         tools=[smart_directory_reader, file_reader],
-        max_rpm=5  # 🐢 Límite estricto para que no explote la API del Pro
+        max_rpm=5
     )
 
     manager = Agent(
         role=manager_conf['role'], goal=manager_conf['goal'], backstory=manager_conf['backstory'],
-        llm=llm_pro, 
-        verbose=True, 
-        allow_delegation=False,
+        llm=llm_pro, verbose=True, allow_delegation=False,
         tools=[smart_directory_reader, file_reader],
-        max_rpm=5  # 🐢 Límite estricto
+        max_rpm=5
     )
     
-    # --- EQUIPO FLASH (Rápidos y Ejecutores) ---
-    # Gemini Flash aguanta mucho más castigo (ej: 15-60+ RPM)
+    # 👇 CAMBIO 1: El Developer ahora tiene 'smart_directory_reader' para ver las carpetas
     dev = Agent(
         role=dev_conf['role'], goal=dev_conf['goal'], backstory=dev_conf['backstory'],
-        llm=llm_flash, 
-        verbose=True, 
-        allow_delegation=False,
-        tools=[file_reader, file_writer, file_deleter],
-        max_rpm=30 # 🐇 Velocidad alta para picar código y borrar archivos
+        llm=llm_flash, verbose=True, allow_delegation=False,
+        tools=[smart_directory_reader, file_reader, file_writer, file_deleter],
+        max_rpm=50
     )
     
     qa = Agent(
         role=qa_conf['role'], goal=qa_conf['goal'], backstory=qa_conf['backstory'],
-        llm=llm_flash, 
-        verbose=True, 
-        allow_delegation=False,
+        llm=llm_flash, verbose=True, allow_delegation=False,
         tools=[file_writer],
-        max_rpm=30 # 🐇 Velocidad alta
+        max_rpm=50
     )
 
     print("🤖 Iniciando el Consejo de Arquitectura...")
@@ -305,8 +299,8 @@ def solve_issue_with_retries(issue):
         description=f"""
         CONTEXT: "{issue.title}: {issue.body}".
         1. LIST files.
-        2. DESIGN target structure using the CURRENT ROOT directory (do not create a parent folder like 'my_project/').
-           - Use 'app/' for code.
+        2. DESIGN target structure using the CURRENT ROOT directory.
+           - Use 'app/' for code (e.g., app/game.py, app/main.py).
            - Use 'tests/' for tests.
         3. DEFINE obsolete files.
         """,
@@ -323,19 +317,28 @@ def solve_issue_with_retries(issue):
         3. EXPLICITLY list the files that the Developer MUST CREATE.
         """,
         agent=manager,
-        expected_output="Actionable Plan with DELETE/CREATE instructions."
+        expected_output="Actionable Plan."
     )
 
-    # TAREA 3: Ejecución
+    # 👇 CAMBIO 2: Instrucción explícita de IMPORT CHECK
     task_code = Task(
         description="""
-        Execute the Plan.
-        1. DELETE obsolete files using the 'Delete File' tool first.
-        2. CREATE/UPDATE the new code files.
-        3. UPDATE 'requirements.txt' if the Stack requires new libraries.
+        Execute the Plan with EXTREME CAUTION regarding Data Loss and Import Paths.
+        
+        CRITICAL ORDER OF OPERATIONS:
+        1. LIST FILES (using 'List Project Files') to confirm the current folder structure.
+        2. READ the content of the existing files.
+        3. CREATE the new folder structure.
+        4. CREATE the new files. 
+           - **IMPORT CHECK**: If you place a file in 'app/', you MUST use absolute imports (e.g., 'from app.game import ...') in 'app/main.py' or tests.
+           - Ensure '__init__.py' exists in 'app/' and 'tests/'.
+        5. VERIFY new files exist.
+        6. ONLY THEN, DELETE the obsolete files using 'Delete File'.
+        
+        WARNING: Do NOT delete a file before you have saved its content in the new location.
         """,
         agent=dev,
-        expected_output="Clean codebase with new features."
+        expected_output="Clean codebase with correct imports."
     )
 
     # TAREA 4: Testing
@@ -345,7 +348,6 @@ def solve_issue_with_retries(issue):
         expected_output="Tests saved."
     )
 
-    # Ejecución de la Fase 1
     crew = Crew(
         agents=[architect, manager, dev, qa], 
         tasks=[task_arch, task_plan, task_code, task_test], 
@@ -356,12 +358,10 @@ def solve_issue_with_retries(issue):
     
     crew.kickoff()
 
-    # 👇 CAPTURA DE CONTEXTO (LA MAGIA) ✨
-    # Guardamos lo que pensaron los "jefes" para usarlo si algo falla
-    original_design = task_arch.output
+    # 👇 CAPTURA DE CONTEXTO
     original_plan = task_plan.output
 
-    # BUCLE DE AUTO-CORRECCIÓN (Solo Dev)
+    # BUCLE DE AUTO-CORRECCIÓN
     while attempt < MAX_RETRIES:
         print(f"\n🔄 Validación {attempt + 1}/{MAX_RETRIES}...")
         tests_passed, error_log = run_docker_tests()
@@ -373,9 +373,6 @@ def solve_issue_with_retries(issue):
             print(f"❌ Fallo en Tests. Reparando...")
             attempt += 1
             if attempt < MAX_RETRIES:
-                
-                # 👇 INYECCIÓN DE CONTEXTO EN LA TAREA DE REPARACIÓN
-                # El Dev recibe el error Y el plan original para no perder el norte
                 fix_task = Task(
                     description=f"""
                     CRITICAL: Tests FAILED.
@@ -384,25 +381,22 @@ def solve_issue_with_retries(issue):
                     {error_log}
                     
                     CONTEXT (ORIGINAL PLAN):
-                    The Architect and Manager originally requested this structure. DO NOT DEVIATE from the design unless necessary to fix the bug:
-                    ---
                     {original_plan}
-                    ---
                     
                     INSTRUCTIONS:
-                    1. Analyze the error.
-                    2. Fix the code or the tests to comply with the Original Plan.
-                    3. Update requirements.txt if it's a 'ModuleNotFoundError'.
+                    1. USE 'List Project Files' to check where the files actually are.
+                    2. Analyze the Import/Module error. 
+                    3. Fix the imports in the code to match the ACTUAL file structure. 
+                       (Example: if 'game.py' is in 'app/', use 'from app.game import ...').
+                    4. Fix the code or tests.
                     """,
                     agent=dev,
                     expected_output="Fixed files."
                 )
-                
-                # Solo despertamos al Developer (Flash) para ahorrar costes
                 fix_crew = Crew(
                     agents=[dev], 
                     tasks=[fix_task], 
-                    verbose=True,
+                    verbose=True, 
                     memory=False
                 )
                 fix_crew.kickoff()
@@ -415,7 +409,7 @@ if __name__ == "__main__":
     print("==========================================")
     print(f"👀 VIGILANTE ACTIVO EN: {REPO_NAME}")
     print("  - Roles: Architect + Manager (Pro) / Dev + QA (Flash)")
-    print("  - NO DELEGATION / NO MEMORY / NO INTERNAL MANAGER")
+    print("  - Protección .env: ACTIVADA 🛡️")
     print("==========================================")
 
     while True:
