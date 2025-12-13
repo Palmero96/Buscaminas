@@ -221,19 +221,28 @@ def create_pull_request(issue_number, issue_title):
 def run_docker_tests():
     print("🧪 Ejecutando Tests en Docker...")
     
+    # Añadimos PYTHONPATH=. para que los tests encuentren la carpeta 'app'
     docker_command = (
         'if [ -f requirements.txt ]; then pip install -r requirements.txt; fi && '
-        'python -m unittest discover -s . -p "test_*.py"'
+        'export PYTHONPATH=$PYTHONPATH:. && '
+        'python -m unittest discover -s tests -p "test_*.py"'
     )
 
     cmd = f'docker run --rm -v "{os.getcwd()}":/app -w /app python:3.10-slim bash -c "{docker_command}"'
     
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    # ⚠️ CAMBIO IMPORTANTE: Eliminamos text=True para manejar bytes manualmente
+    result = subprocess.run(cmd, shell=True, capture_output=True)
     
+    # Decodificamos con seguridad (ignorando errores de caracteres raros)
+    stdout = result.stdout.decode('utf-8', errors='replace')
+    stderr = result.stderr.decode('utf-8', errors='replace')
+    
+    full_output = stdout + "\n" + stderr
+
     if result.returncode == 0:
-        return True, result.stderr
+        return True, stderr # A veces unittest escribe en stderr aunque pase
     else:
-        return False, result.stderr
+        return False, full_output
 
 # --- LÓGICA DE RESOLUCIÓN ---
 
