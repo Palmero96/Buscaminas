@@ -88,19 +88,40 @@ agents_config = load_agents_config()
 
 class UTF8FileWriterTool(FileWriterTool):
     name: str = "Save File UTF-8"
-    description: str = "Saves content to a file. Input: filename, content."
+    description: str = "Saves content to a file. You can specify the directory separately. Input: filename, content, directory (optional)."
     
-    def _run(self, filename: str, content: str, **kwargs) -> str:
-        forbidden_files = ['main.py', '.env', 'agents.json', 'Procfile', 'Dockerfile'] 
-        clean_name = os.path.basename(filename)
+    # 👇 CAMBIO CRÍTICO: 'directory' ahora es un argumento explícito con valor por defecto None
+    def _run(self, filename: str, content: str, directory: str = None, **kwargs) -> str:
+        forbidden_files = ['main.py', '.env', 'agents.json', 'Procfile', 'Dockerfile']
+        
+        # 1. Construcción de la ruta
+        if directory:
+            # Si el agente envía "app" y "routes.py", creamos "app/routes.py"
+            file_path = os.path.join(directory, filename)
+        else:
+            file_path = filename
 
+        clean_name = os.path.basename(file_path)
+
+        # 2. Seguridad
         if clean_name in forbidden_files:
             return f"❌ SECURITY ERROR: Modification of '{clean_name}' is forbidden."
 
         try:
-            with open(filename, 'w', encoding='utf-8') as f:
+            # 3. Creación de carpetas (Auto-Healing)
+            target_folder = os.path.dirname(file_path)
+            if target_folder and not os.path.exists(target_folder):
+                try:
+                    os.makedirs(target_folder)
+                    print(f"📁 Carpeta creada automáticamente: {target_folder}")
+                except OSError as e:
+                    return f"Error creating directory {target_folder}: {e}"
+            
+            # 4. Escritura
+            with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(content)
-            return f"File {filename} saved successfully."
+            return f"File {file_path} saved successfully."
+            
         except Exception as e:
             return f"Error saving: {e}"
 
@@ -226,28 +247,46 @@ def solve_issue_with_retries(issue):
     dev_conf = agents_config['developer']
     qa_conf = agents_config['qa']
 
+    # 1. Definición de Agentes con LIMITES INDIVIDUALES
+    
+    # --- EQUIPO PRO (Lentos y Pensadores) ---
+    # Gemini Pro suele tener límites estrictos (ej: 2-60 RPM según tu plan)
     architect = Agent(
         role=arch_conf['role'], goal=arch_conf['goal'], backstory=arch_conf['backstory'],
-        llm=llm_pro, verbose=True, allow_delegation=False, 
-        tools=[smart_directory_reader, file_reader]
+        llm=llm_pro, 
+        verbose=True, 
+        allow_delegation=False, 
+        tools=[smart_directory_reader, file_reader],
+        max_rpm=5  # 🐢 Límite estricto para que no explote la API del Pro
     )
 
     manager = Agent(
         role=manager_conf['role'], goal=manager_conf['goal'], backstory=manager_conf['backstory'],
-        llm=llm_pro, verbose=True, allow_delegation=False,
-        tools=[smart_directory_reader, file_reader]
+        llm=llm_pro, 
+        verbose=True, 
+        allow_delegation=False,
+        tools=[smart_directory_reader, file_reader],
+        max_rpm=5  # 🐢 Límite estricto
     )
     
+    # --- EQUIPO FLASH (Rápidos y Ejecutores) ---
+    # Gemini Flash aguanta mucho más castigo (ej: 15-60+ RPM)
     dev = Agent(
         role=dev_conf['role'], goal=dev_conf['goal'], backstory=dev_conf['backstory'],
-        llm=llm_flash, verbose=True, allow_delegation=False,
-        tools=[file_reader, file_writer, file_deleter] 
+        llm=llm_flash, 
+        verbose=True, 
+        allow_delegation=False,
+        tools=[file_reader, file_writer, file_deleter],
+        max_rpm=30 # 🐇 Velocidad alta para picar código y borrar archivos
     )
     
     qa = Agent(
         role=qa_conf['role'], goal=qa_conf['goal'], backstory=qa_conf['backstory'],
-        llm=llm_flash, verbose=True, allow_delegation=False,
-        tools=[file_writer]
+        llm=llm_flash, 
+        verbose=True, 
+        allow_delegation=False,
+        tools=[file_writer],
+        max_rpm=30 # 🐇 Velocidad alta
     )
 
     print("🤖 Iniciando el Consejo de Arquitectura...")
@@ -256,12 +295,14 @@ def solve_issue_with_retries(issue):
     task_arch = Task(
         description=f"""
         CONTEXT: "{issue.title}: {issue.body}".
-        1. LIST files to see current structure.
-        2. DESIGN the target directory structure and Tech Stack.
-        3. DEFINE which files are now obsolete and must be deleted.
+        1. LIST files.
+        2. DESIGN target structure using the CURRENT ROOT directory (do not create a parent folder like 'my_project/').
+           - Use 'app/' for code.
+           - Use 'tests/' for tests.
+        3. DEFINE obsolete files.
         """,
         agent=architect,
-        expected_output="Architecture Design & File Structure."
+        expected_output="Architecture Design."
     )
 
     # TAREA 2: Planificación
@@ -301,7 +342,6 @@ def solve_issue_with_retries(issue):
         tasks=[task_arch, task_plan, task_code, task_test], 
         verbose=True, 
         process=Process.sequential, 
-        max_rpm=10,
         memory=False
     )
     
@@ -353,8 +393,7 @@ def solve_issue_with_retries(issue):
                 fix_crew = Crew(
                     agents=[dev], 
                     tasks=[fix_task], 
-                    verbose=True, 
-                    max_rpm=10,
+                    verbose=True,
                     memory=False
                 )
                 fix_crew.kickoff()
